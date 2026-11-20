@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# git-merge-up: like `git rebase --update-refs`, but using merge.
+#
+# Merges <base> into the first branch of a stack, then that branch into the
+# next one, and so on up the stack. Ends on the last (top) branch, unless
+# local changes were autostashed (see Behavior).
+#
+# Usage:
+#   git merge-up [--push] [--dry-run] <base> [branch1 ... branchN]
+#   git merge-up --continue
+#   git merge-up --abort
+#
+# Options:
+#   --push       Push every branch of the stack once all merges succeeded.
+#   --dry-run    Print the merge plan without changing anything.
+#   --continue   Resume after resolving conflicts (run `git add` first).
+#   --abort      Cancel the operation and restore every branch, the original
+#                checkout and any autostashed changes.
+#   -h, --help   Show this help.
+#
+# Branch selection:
+#   With explicit branches, they are processed in the given order.
+#   Without them, the chain is detected: local branches that are ancestors of
+#   the current branch and not yet part of <base>, ordered bottom to top. The
+#   current branch is always the top of the stack. Other branches pointing at
+#   the same commit as the current one (e.g. backups) are skipped.
+#
+# Behavior:
+#   - Autostash: local changes (including untracked files) are stashed at the
+#     start and restored on the branch where you started. In that case the
+#     script ends on that branch instead of the top one.
+#   - Conflicts: the script stops and keeps its state in .git/merge-up/.
+#     Resolve them, `git add` the files, then run `git merge-up --continue`.
+#   - Abort: runs `git merge --abort` if needed, resets each branch to the
+#     commit it pointed to before the run, and returns to the original branch.
+#     Note this discards any extra commits made on those branches meanwhile.
+#   - Push happens only at the end, so --abort can always undo everything.
+
+# ---------------------------------------------------------------------------
+# Overall flow
+#
+#   start     -> validate input -> build the chain -> save state
+#                -> autostash -> run_loop
+#   run_loop  -> for each branch: checkout, merge its parent
+#                (on conflict: stop, state stays on disk)
+#                -> optional push -> final checkout + restore stash
+#                -> delete state
+#   continue  -> load state -> commit the pending merge -> run_loop
+#                (resumes at the branch that had the conflict)
+#   abort     -> load state -> cancel pending merge -> reset every branch
+#                to its original commit -> back to start branch
+#                -> restore stash -> delete state
+#
+# State lives in .git/merge-up/ (same idea as .git/rebase-merge/ for rebase):
+#   meta   shell variables: BASE, PUSH, IDX (current step), STASH_SHA, START_REF
+#   chain  one branch per line, bottom to top
+#   orig   "<branch> <sha>" per line: where each branch pointed before the run
+# ---------------------------------------------------------------------------
+
+# Exit on any error, on unset variables, and on failures inside pipelines.
+set -euo pipefail
+
+usage() { echo "Usage: git merge-up [--push] [--dry-run] <base> [branches...] | --continue | --abort" >&2; }
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# Done before any git call so that --help works outside a repository.
+# ---------------------------------------------------------------------------
+ACTION=start
+PUSH=0
+DRY=0
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --continue) ACTION=continue ;;
+    --abort)    ACTION=abort ;;
+    --push)     PUSH=1 ;;
+    --dry-run)  DRY=1 ;;
+    -h|--help)  # Print the header comment block (everything up to the first non-comment line).
+                awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+                exit 0 ;;
+    -*)         echo "Unknown option: $arg" >&2; usage; exit 1 ;;
+    *)          POSITIONAL+=("$arg") ;;
+  esac
+done
+
+# Absolute path to .git (also correct inside worktrees and submodules).
+GITDIR="$(git rev-parse --absolute-git-dir 2>/dev/null)" \
+  || { echo "Not inside a git repository." >&2; exit 1; }
+STATE="$GITDIR/merge-up"
+
+# Run state. These are written to / read from $STATE/meta.
+BASE=""        # branch or ref merged into the bottom of the stack
+IDX=0          # index in CHAIN of the branch currently being merged
+STASH_SHA=""   # commit of the autostash, empty if nothing was stashed
+START_REF=""   # branch (or SHA if detached) checked out when the run began
+CHAIN=()       # branches of the stack, bottom to top
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Persist run state so --continue / --abort can pick up where we left off.
+# %q quotes values safely so the file can be sourced back.
+save_meta() {
+  printf 'BASE=%q\nPUSH=%q\nIDX=%q\nSTASH_SHA=%q\nSTART_REF=%q\n' \
+    "$BASE" "$PUSH" "$IDX" "$STASH_SHA" "$START_REF" > "$STATE/meta"
+}
+
+# Load the state saved by a previous run (used by --continue and --abort).
+load_state() {
+  [ -f "$STATE/meta" ] || { echo "No merge-up operation in progress." >&2; exit 1; }
+  # shellcheck disable=SC1091
+  . "$STATE/meta"
+  CHAIN=()
+  # A while-read loop instead of `mapfile`, to stay compatible with bash 3.2 (macOS).
+  while IFS= read -r line; do CHAIN+=("$line"); done < "$STATE/chain"
+}
+
+# Print "Chain: base -> b1 -> b2 -> ...".
+print_chain() {
+  printf 'Chain: %s' "$BASE"
+  printf ' -> %s' "${CHAIN[@]}"
+  echo
+}
+
+# Re-apply the autostash on the current branch. The stash entry is dropped
+# only if it applied cleanly; otherwise it is kept so nothing is lost.
+restore_stash() {
+  [ -n "$STASH_SHA" ] || return 0
+  if git stash apply --quiet "$STASH_SHA"; then
+    # Find the stash@{n} entry that matches our SHA (other stashes may exist).
+    local ref
+    ref="$(git stash list --format='%H %gd' | awk -v s="$STASH_SHA" '$1==s{print $2}')"
+    [ -n "$ref" ] && git stash drop --quiet "$ref"
+    echo "Local changes restored."
+  else
+    echo "Could not restore the autostash automatically (conflict)." >&2
+    echo "Your changes are still saved: git stash apply $STASH_SHA" >&2
+  fi
+}
+
+# Build CHAIN automatically, using the current branch as the top of the stack.
+#
+# A local branch belongs to the chain when:
+#   - it is an ancestor of the current branch (it sits below it in the stack),
+#   - it is not already contained in BASE (it still has work of its own),
+#   - it does not point at the same commit as the current branch (backups).
+#
+# Ordering: the more commits between a branch and the top, the lower it sits
+# in the stack. Sorting by that count (descending) gives bottom-to-top order.
+detect_chain() {
+  local tip tip_sha
+  tip="$(git symbolic-ref --quiet --short HEAD)" \
+    || { echo "Detached HEAD: pass the branches explicitly." >&2; exit 1; }
+  tip_sha="$(git rev-parse "refs/heads/$tip")"
+  while IFS= read -r line; do CHAIN+=("$line"); done < <(
+    git for-each-ref --format='%(refname:short) %(objectname)' refs/heads | while read -r b sha; do
+      [ "$b" = "$BASE" ] && continue
+      [ "$b" = "$tip" ] && continue
+      if [ "$sha" = "$tip_sha" ]; then
+        echo "Skipping $b (same commit as $tip)." >&2
+        continue
+      fi
+      git merge-base --is-ancestor "$b" "$tip" || continue    # not below the top
+      git merge-base --is-ancestor "$b" "$BASE" && continue   # already in base
+      echo "$(git rev-list --count "$b..$tip") $b"            # "<distance> <branch>"
+    done | sort -rn | awk '{print $2}'
+  )
+  CHAIN+=("$tip")   # the current branch is always the top of the stack
+}
+
+# ---------------------------------------------------------------------------
+# Main loop: merge each branch's parent into it, bottom to top.
+#
+# Starts at IDX, so --continue resumes exactly where the conflict happened.
+# Re-running a merge that was already completed is harmless: git just reports
+# "Already up to date".
+# ---------------------------------------------------------------------------
+run_loop() {
+  local n=${#CHAIN[@]} i prev b remote top
+  for ((i = IDX; i < n; i++)); do
+    # Save the step before merging, so a conflict leaves IDX pointing here.
+    IDX=$i; save_meta
+    b="${CHAIN[$i]}"
+    # The parent of the first branch is BASE; for the rest, the branch below.
+    if [ "$i" -eq 0 ]; then prev="$BASE"; else prev="${CHAIN[$((i-1))]}"; fi
+    echo "==> $b  <-  $prev"
+    git checkout --quiet "$b"
+    if ! git merge --no-edit "$prev"; then
+      # Leave the repo mid-merge and keep the state; the user resolves it.
+      echo >&2
+      echo "Conflict while merging '$prev' into '$b'." >&2
+      echo "Resolve it, run 'git add', then: git merge-up --continue" >&2
+      echo "To cancel everything:            git merge-up --abort" >&2
+      exit 1
+    fi
+  done
+
+  # Push only once every merge succeeded, so nothing half-done reaches the remote.
+  if [ "$PUSH" -eq 1 ]; then
+    for b in "${CHAIN[@]}"; do
+      remote="$(git config "branch.$b.remote" || true)"
+      if [ -n "$remote" ]; then
+        git push "$remote" "$b"
+      else
+        echo "(no remote configured for $b, skipping push)"
+      fi
+    done
+  fi
+
+  # Final position:
+  #   - with an autostash: go back to the starting branch and restore the
+  #     changes there, so work in progress stays on the branch it belongs to;
+  #   - otherwise: end on the top of the stack.
+  top="${CHAIN[$((n-1))]}"
+  if [ -n "$STASH_SHA" ]; then
+    git checkout --quiet "$START_REF"
+    restore_stash
+    rm -rf "$STATE"
+    echo "Done. Stack updated up to $top; you are back on $START_REF."
+  else
+    git checkout --quiet "$top"
+    rm -rf "$STATE"
+    echo "Done. You are on $top."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+case "$ACTION" in
+  start)
+    # --- 1. Sanity checks: nothing in progress, valid input. ---------------
+    [ "${#POSITIONAL[@]}" -ge 1 ] || { usage; exit 1; }
+    [ ! -d "$STATE" ] || { echo "A merge-up is already in progress: use --continue or --abort." >&2; exit 1; }
+    [ ! -f "$GITDIR/MERGE_HEAD" ] || { echo "A merge is in progress outside merge-up. Finish it first." >&2; exit 1; }
+    BASE="${POSITIONAL[0]}"
+    CHAIN=("${POSITIONAL[@]:1}")
+    git rev-parse --verify --quiet "$BASE" >/dev/null || { echo "Base does not exist: $BASE" >&2; exit 1; }
+
+    # Validate explicit branches before touching anything, so a typo never
+    # leaves a half-written state behind. The ${x[@]+...} form avoids an
+    # "unbound variable" error on empty arrays in bash 3.2.
+    for b in "${CHAIN[@]+"${CHAIN[@]}"}"; do
+      git show-ref --verify --quiet "refs/heads/$b" \
+        || { echo "Local branch does not exist: $b" >&2; exit 1; }
+    done
+
+    # --- 2. Build the chain (auto-detect if no branches were given). -------
+    [ "${#CHAIN[@]}" -gt 0 ] || detect_chain
+
+    print_chain
+    if [ "$DRY" -eq 1 ]; then
+      prev="$BASE"
+      for b in "${CHAIN[@]}"; do echo "  merge $prev into $b"; prev="$b"; done
+      exit 0
+    fi
+
+    # --- 3. Save state: where we are and where every branch points. --------
+    # From here on, --abort can restore everything.
+    START_REF="$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)"
+    mkdir -p "$STATE"
+    printf '%s\n' "${CHAIN[@]}" > "$STATE/chain"
+    : > "$STATE/orig"
+    for b in "${CHAIN[@]}"; do echo "$b $(git rev-parse "refs/heads/$b")" >> "$STATE/orig"; done
+
+    # --- 4. Autostash local changes so checkouts and merges start clean. ---
+    if [ -n "$(git status --porcelain)" ]; then
+      git stash push --include-untracked --quiet -m "merge-up autostash"
+      STASH_SHA="$(git rev-parse refs/stash)"
+      echo "Local changes stashed."
+    fi
+
+    # --- 5. Merge up the stack. -------------------------------------------
+    IDX=0; save_meta
+    run_loop
+    ;;
+
+  continue)
+    load_state
+    # If the user resolved the conflict but did not commit yet, commit it now.
+    # If they already committed (MERGE_HEAD gone), there is nothing to do here.
+    if [ -f "$GITDIR/MERGE_HEAD" ]; then
+      if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+        echo "There are still unresolved conflicts (run 'git add' once resolved)." >&2
+        exit 1
+      fi
+      git commit --no-edit
+    fi
+    # Resume at IDX; if that merge was already done, it reports "Already up to date".
+    run_loop
+    ;;
+
+  abort)
+    load_state
+    # Cancel the conflicted merge, if one is pending.
+    [ ! -f "$GITDIR/MERGE_HEAD" ] || git merge --abort
+    # Put every branch back on the commit it had before the run.
+    while read -r b sha; do
+      git checkout --quiet "$b"
+      git reset --hard --quiet "$sha"
+    done < "$STATE/orig"
+    # Return to the starting branch and bring the local changes back there.
+    git checkout --quiet "$START_REF"
+    restore_stash
+    rm -rf "$STATE"
+    echo "Aborted: branches restored to their original state."
+    ;;
+esac
